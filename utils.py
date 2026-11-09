@@ -1,6 +1,6 @@
 """
 utils.py - pure helper functions (no Streamlit, no network).
-Kept separate from app.py so they can be unit tested: python -m unittest test_utils -v
+Kept separate from app.py so they can be unit tested:  python -m unittest discover -v
 """
 import ast
 import json
@@ -47,11 +47,15 @@ def map_error(error):
 # ============================================================
 # Prompt helpers
 # ============================================================
+def split_lines(code):
+    """Split code into lines. Leading blank lines are kept so line numbers match
+    the student's original snippet (only trailing whitespace is removed)."""
+    return code.replace("\r\n", "\n").rstrip().split("\n")
+
+
 def number_lines(code):
-    """Add line numbers. Leading blank lines are kept so numbers match the
-    student's original snippet (only trailing whitespace is removed)."""
-    lines = code.replace("\r\n", "\n").rstrip().split("\n")
-    return "\n".join(f"{i}: {line}" for i, line in enumerate(lines, start=1))
+    """Add line numbers (1-based) using the same splitting as validate_fix()."""
+    return "\n".join(f"{i}: {line}" for i, line in enumerate(split_lines(code), start=1))
 
 
 def wrap_untrusted(tag, text):
@@ -62,7 +66,7 @@ def wrap_untrusted(tag, text):
 
 
 # ============================================================
-# JSON parsing + validation
+# JSON parsing
 # ============================================================
 def extract_json(text):
     """Pull a JSON object out of a model reply (handles ```json fences).
@@ -80,13 +84,89 @@ def extract_json(text):
     return data if isinstance(data, dict) else None
 
 
+# ============================================================
+# Change-list rules
+#
+# Every change refers to the ORIGINAL code (1-based line numbers):
+#   replace : line 1..N        before = exact original line, after = new text (not empty)
+#   delete  : line 1..N        before = exact original line, after = ""
+#   insert  : line 1..N+1      before = "",  after = new text. The new line is placed
+#                              BEFORE original line `line` (N+1 means "add at the end").
+# "before" is compared with the original line ignoring leading/trailing spaces.
+# A line may be replaced or deleted only once.
+#
+# Whitespace policy used when comparing code (normalize_code):
+#   line endings, trailing spaces and blank lines are ignored;
+#   indentation and every other character must match exactly.
+# ============================================================
+ALLOWED_ACTIONS = ("replace", "insert", "delete")
+
+
+def normalize_code(code):
+    """Return the code as a list of lines for comparison (see whitespace policy above)."""
+    lines = [line.rstrip() for line in code.replace("\r\n", "\n").split("\n")]
+    return [line for line in lines if line.strip()]
+
+
+def apply_changes(original_code, changes):
+    """Apply a validated change list to the original code.
+    Returns (new_code, None) or (None, reason)."""
+    lines = split_lines(original_code)
+    total = len(lines)
+    replaced = {}   # original line number -> new text, or None when the line is deleted
+    inserts = {}    # original line number -> new lines inserted before it
+
+    for change in changes:
+        action, line = change["action"], change["line"]
+        before, after = change["before"], change["after"]
+
+        if action == "insert":
+            if not 1 <= line <= total + 1:
+                return None, (f"line {line} is not valid for an insert; the original code has "
+                              f"{total} lines (use 1 to {total + 1})")
+            if before.strip():
+                return None, "an insert must have an empty 'before'"
+            if not after.strip():
+                return None, "an insert needs text in 'after'"
+            inserts.setdefault(line, []).append(after)
+            continue
+
+        if not 1 <= line <= total:
+            return None, f"line {line} does not exist; the original code has {total} lines"
+        if line in replaced:
+            return None, f"line {line} is changed more than once"
+        if before.strip() != lines[line - 1].strip():
+            return None, f"'before' for line {line} does not match the original code on that line"
+        if action == "replace":
+            if not after.strip():
+                return None, f"a replace on line {line} needs text in 'after' (use delete to remove a line)"
+            replaced[line] = after
+        else:  # delete
+            if after.strip():
+                return None, f"a delete on line {line} must have an empty 'after'"
+            replaced[line] = None
+
+    result = []
+    for number in range(1, total + 2):
+        result.extend(inserts.get(number, []))
+        if number <= total:
+            if number not in replaced:
+                result.append(lines[number - 1])
+            elif replaced[number] is not None:
+                result.append(replaced[number])
+    return "\n".join(result), None
+
+
+# ============================================================
+# Fix validation
+# ============================================================
 def _clean_text(value):
     return value.strip() if isinstance(value, str) else ""
 
 
-def validate_fix(data):
-    """Check the VALUES and TYPES of a fix suggestion, not just the keys.
-    Returns (cleaned_dict, None) if valid, or (None, reason) if not."""
+def validate_fix(data, original_code):
+    """Check the VALUES and TYPES of a fix suggestion AND check it against the
+    student's original code. Returns (cleaned_dict, None) or (None, reason)."""
     if not isinstance(data, dict):
         return None, "the reply is not a JSON object"
 
@@ -117,6 +197,9 @@ def validate_fix(data):
     for item in changes:
         if not isinstance(item, dict):
             return None, "every item in 'changes' must be an object"
+        action = item.get("action")
+        if not isinstance(action, str) or action not in ALLOWED_ACTIONS:
+            return None, "'action' in each change must be one of: replace, insert, delete"
         line = item.get("line")
         if isinstance(line, bool) or not isinstance(line, (int, str)):
             return None, "'line' in each change must be a number"
@@ -127,9 +210,20 @@ def validate_fix(data):
         before, after, reason = item.get("before"), item.get("after"), item.get("reason")
         if not isinstance(before, str) or not isinstance(after, str) or not _clean_text(reason):
             return None, "each change needs text for 'before', 'after' and 'reason'"
-        cleaned_changes.append({"line": line, "before": before, "after": after,
-                                "reason": reason.strip()})
+        cleaned_changes.append({"line": line, "action": action, "before": before,
+                                "after": after, "reason": reason.strip()})
     cleaned["changes"] = cleaned_changes
+
+    # --- check against the ORIGINAL code ---
+    new_code, problem = apply_changes(original_code, cleaned_changes)
+    if problem:
+        return None, problem
+    if normalize_code(new_code) != normalize_code(cleaned["fixed_code"]):
+        if not cleaned_changes:
+            return None, ("'changes' is empty but 'fixed_code' is different from the original code. "
+                          "List every change, or return the original code unchanged if it is already correct")
+        return None, ("applying the listed 'changes' to the original code does not produce "
+                      "'fixed_code'; the change list is incomplete or wrong")
     return cleaned, None
 
 
@@ -146,3 +240,32 @@ def check_python_syntax(code):
         return False, f"line {error.lineno}: {error.msg}"
     except (ValueError, MemoryError, RecursionError) as error:
         return False, str(error)
+
+
+# ============================================================
+# Context for follow-up chat
+# ============================================================
+def build_chat_context(explanation="", analysis="", fix=None, limit=2500):
+    """Text describing what the app has already shown the student, so the chat can
+    answer questions such as 'Why did you change this line?'. Returns "" if nothing yet."""
+    parts = []
+    if explanation and explanation.strip():
+        parts.append("EXPLANATION SHOWN TO THE STUDENT:\n" + explanation.strip()[:limit])
+    if analysis and analysis.strip():
+        parts.append("ERROR ANALYSIS SHOWN TO THE STUDENT:\n" + analysis.strip()[:limit])
+    if fix:
+        lines = ["SUGGESTED FIX SHOWN TO THE STUDENT:",
+                 f"Error type: {fix.get('error_type', '')}",
+                 f"Root cause: {fix.get('root_cause', '')}",
+                 "Changes (line numbers refer to the ORIGINAL code):"]
+        changes = fix.get("changes") or []
+        if not changes:
+            lines.append("- none (the AI said the code needed no changes)")
+        for change in changes:
+            lines.append(f"- line {change.get('line')} ({change.get('action')}): "
+                         f"'{change.get('before')}' -> '{change.get('after')}' "
+                         f"because {change.get('reason')}")
+        lines.append("Corrected code:\n" + str(fix.get("fixed_code", ""))[:limit])
+        lines.append("Explanation: " + str(fix.get("explanation", "")))
+        parts.append("\n".join(lines))
+    return "\n\n".join(parts)
