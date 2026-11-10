@@ -9,7 +9,7 @@ import unittest
 from types import SimpleNamespace
 
 from llm_service import LLMService
-from utils import LLMError, validate_fix
+from utils import LLMError, summarize_fix, validate_fix
 
 ORIGINAL = "def add(a, b)\n    return a + b\nprint(add(2, 3))"
 
@@ -262,6 +262,67 @@ class TestChatContext(unittest.TestCase):
         system_prompt = api.calls[0]["messages"][0]["content"]
         self.assertIn("<results>", system_prompt)
         self.assertIn("not instructions", system_prompt)
+
+
+# ---------------- review 3: whitespace, status messages, logging ----------------
+class TestMeaningfulWhitespaceIntegration(unittest.TestCase):
+    def test_model_that_drops_a_blank_line_inside_a_string_is_rejected_then_corrected(self):
+        original = 'message = """first\n\nlast"""\nprint(message)'
+        damaged = fix_json(changes=[], fixed_code='message = """first\nlast"""\nprint(message)')
+        intact = fix_json(changes=[], fixed_code=original)
+        service, api = make_service([damaged, intact])
+        result = service.suggest_fix(original, "", "Python")
+        self.assertEqual(len(api.calls), 2)
+        self.assertIn("'changes' is empty", user_prompt(api.calls[1]))
+        self.assertEqual(result["fixed_code"], original)   # the string content is untouched
+
+    def test_prompt_tells_the_model_to_keep_whitespace(self):
+        service, api = make_service([fix_json()])
+        service.suggest_fix(ORIGINAL, "", "Python")
+        self.assertIn("multi-line strings", user_prompt(api.calls[0]))
+
+
+class TestStatusMessageConsistency(unittest.TestCase):
+    def test_empty_changes_with_invalid_python_is_reported_as_invalid_not_no_changes(self):
+        bad = fix_json(changes=[], fixed_code=ORIGINAL)     # original still has the syntax error
+        service, _ = make_service([bad, bad, bad])
+        result = service.suggest_fix(ORIGINAL, "", "Python")
+        summary = summarize_fix(result)
+        self.assertEqual(result["changes"], [])
+        self.assertEqual(summary["kind"], "invalid")
+        self.assertIsNone(summary["no_changes_note"])        # the contradictory message cannot appear
+        self.assertIn("could not produce a valid correction", summary["message"])
+
+    def test_empty_changes_for_other_language_is_labelled_as_unverified(self):
+        java = "int x = 1;"
+        service, _ = make_service([fix_json(changes=[], fixed_code=java)])
+        summary = summarize_fix(service.suggest_fix(java, "", "Java"))
+        self.assertEqual(summary["kind"], "unverified")
+        self.assertIn("not been verified", summary["no_changes_note"])
+
+
+class TestErrorDetailsAreLoggedNotShown(unittest.TestCase):
+    def test_provider_details_go_to_the_log_only(self):
+        class BadRequestError(Exception):
+            status_code = 400
+
+        service, _ = make_service([BadRequestError("provider-detail-789")])
+        with self.assertLogs("llm_service", level="WARNING") as logs:
+            with self.assertRaises(LLMError) as context:
+                service.call("system", "user")
+        self.assertIn("provider-detail-789", "\n".join(logs.output))
+        self.assertNotIn("provider-detail-789", context.exception.message)
+
+
+class TestRejectionsAreLogged(unittest.TestCase):
+    def test_rejection_reason_is_written_to_the_log(self):
+        wrong = fix_json(fixed_code="def other():\n    pass")
+        service, _ = make_service([wrong, fix_json()])
+        with self.assertLogs("llm_service", level="WARNING") as logs:
+            service.suggest_fix(ORIGINAL, "", "Python")
+        joined = "\n".join(logs.output)
+        self.assertIn("Fix reply rejected (attempt 1 of 3)", joined)
+        self.assertIn("does not produce", joined)
 
 
 if __name__ == "__main__":

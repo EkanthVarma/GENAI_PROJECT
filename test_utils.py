@@ -2,9 +2,9 @@
 import copy
 import unittest
 
-from utils import (LLMError, apply_changes, build_chat_context, check_python_syntax,
-                   extract_json, map_error, normalize_code, number_lines,
-                   validate_fix, wrap_untrusted)
+from utils import (LLMError, apply_changes, build_chat_context, canonical_code,
+                   check_python_syntax, extract_json, map_error, number_lines,
+                   summarize_fix, validate_fix, wrap_untrusted)
 
 ORIGINAL = "def add(a, b)\n    return a + b\nprint(add(2, 3))"
 
@@ -234,28 +234,100 @@ class TestNoChangesNeeded(unittest.TestCase):
 
 
 class TestWhitespacePolicy(unittest.TestCase):
-    def test_normalize_ignores_blank_lines_trailing_spaces_and_crlf(self):
-        self.assertEqual(normalize_code("a  \r\n\r\n  b\n\n"), ["a", "  b"])
+    """Only line endings and whitespace at the very end of the snippet are normalised."""
 
-    def test_extra_blank_lines_and_trailing_spaces_accepted(self):
+    def test_canonical_converts_line_endings_and_trims_the_end_only(self):
+        self.assertEqual(canonical_code("a\r\nb\r\n\r\n"), "a\nb")
+        self.assertEqual(canonical_code("a\rb"), "a\nb")
+
+    def test_canonical_keeps_blank_lines_and_trailing_spaces_inside(self):
+        self.assertEqual(canonical_code("a  \n\n  b\n\n"), "a  \n\n  b")
+
+    def test_windows_line_endings_in_returned_code_accepted(self):
         data = good_fix()
-        data["fixed_code"] = "def add(a, b):   \n\n    return a + b\n\nprint(add(2, 3))\n"
+        data["fixed_code"] = "def add(a, b):\r\n    return a + b\r\nprint(add(2, 3))\r\n"
         self.assertIsNotNone(check(data)[0])
+
+    def test_whitespace_at_the_very_end_is_ignored(self):
+        data = good_fix()
+        data["fixed_code"] += "\n\n   \n"
+        self.assertIsNotNone(check(data)[0])
+
+    def test_extra_blank_line_between_lines_is_rejected(self):
+        data = good_fix()
+        data["fixed_code"] = "def add(a, b):\n\n    return a + b\nprint(add(2, 3))"
+        self.assertIsNone(check(data)[0])
+
+    def test_trailing_spaces_on_a_line_are_rejected(self):
+        data = good_fix()
+        data["fixed_code"] = "def add(a, b):   \n    return a + b\nprint(add(2, 3))"
+        self.assertIsNone(check(data)[0])
 
     def test_changed_indentation_rejected(self):
         data = good_fix()
         data["fixed_code"] = "def add(a, b):\nreturn a + b\nprint(add(2, 3))"
         self.assertIsNone(check(data)[0])
 
-    def test_leading_blank_lines_keep_line_numbers(self):
+    def test_leading_blank_lines_keep_line_numbers_and_are_kept(self):
         original = "\n\nprint(x)"
         data = good_fix()
         data["changes"] = [{"line": 3, "action": "replace", "before": "print(x)",
                             "after": "print(1)", "reason": "x was undefined"}]
-        data["fixed_code"] = "print(1)"
+        data["fixed_code"] = "\n\nprint(1)"
         self.assertIsNotNone(check(data, original)[0])
-        data["changes"][0]["line"] = 1   # would be right if blank lines had been dropped
+        data["fixed_code"] = "print(1)"            # leading blank lines dropped -> not the same program text
         self.assertIsNone(check(data, original)[0])
+        data["fixed_code"] = "\n\nprint(1)"
+        data["changes"][0]["line"] = 1             # would be right only if blank lines were ignored
+        self.assertIsNone(check(data, original)[0])
+
+
+class TestMeaningfulWhitespace(unittest.TestCase):
+    """Regression tests: blank lines and spaces inside strings are program data."""
+
+    def with_code(self, original, fixed, changes=None):
+        data = good_fix()
+        data["changes"] = changes or []
+        data["fixed_code"] = fixed
+        return validate_fix(data, original)
+
+    def test_multiline_string_blank_line_removed_is_rejected_for_empty_changes(self):
+        original = 'message = """first\n\nlast"""\nprint(message)'
+        returned = 'message = """first\nlast"""\nprint(message)'
+        cleaned, problem = self.with_code(original, returned)
+        self.assertIsNone(cleaned)
+        self.assertIn("'changes' is empty", problem)
+
+    def test_identical_multiline_string_is_accepted_as_unchanged(self):
+        original = 'message = """first\n\nlast"""\nprint(message)'
+        self.assertIsNotNone(self.with_code(original, original)[0])
+
+    def test_trailing_spaces_inside_a_string_are_preserved(self):
+        original = 's = """a  \nb"""\nprint(s)'
+        stripped = 's = """a\nb"""\nprint(s)'
+        self.assertIsNone(self.with_code(original, stripped)[0])
+
+    def test_javascript_template_literal_blank_line_is_preserved(self):
+        original = "const m = `first\n\nlast`;\nconsole.log(m);"
+        returned = "const m = `first\nlast`;\nconsole.log(m);"
+        self.assertIsNone(self.with_code(original, returned)[0])
+        self.assertIsNotNone(self.with_code(original, original)[0])
+
+    def test_docstring_with_embedded_text_blank_line_is_preserved(self):
+        original = 'def f():\n    """Line one.\n\n    Line two."""\n    return 1'
+        returned = 'def f():\n    """Line one.\n    Line two."""\n    return 1'
+        self.assertIsNone(self.with_code(original, returned)[0])
+
+    def test_real_fix_next_to_a_multiline_string_keeps_the_string_intact(self):
+        original = 'message = """first\n\nlast"""\nprint(mesage)'
+        change = [{"line": 4, "action": "replace", "before": "print(mesage)",
+                   "after": "print(message)", "reason": "typo in the variable name"}]
+        good = 'message = """first\n\nlast"""\nprint(message)'
+        damaged = 'message = """first\nlast"""\nprint(message)'
+        self.assertIsNotNone(self.with_code(original, good, change)[0])
+        cleaned, problem = self.with_code(original, damaged, change)
+        self.assertIsNone(cleaned)
+        self.assertIn("does not produce", problem)
 
 
 class TestApplyChanges(unittest.TestCase):
@@ -332,6 +404,62 @@ class TestBuildChatContext(unittest.TestCase):
     def test_no_changes_is_described(self):
         fix = copy.deepcopy(good_fix()); fix["changes"] = []
         self.assertIn("needed no changes", build_chat_context("", "", fix))
+
+
+class TestSummarizeFix(unittest.TestCase):
+    """The interface may only say 'no changes needed' when that agrees with the validation outcome."""
+
+    def fix(self, changes, syntax):
+        data = copy.deepcopy(good_fix())
+        data["changes"] = changes
+        data["syntax"] = syntax
+        return data
+
+    PY_OK = {"checked": True, "ok": True, "message": "No syntax errors found."}
+    PY_BAD = {"checked": True, "ok": False, "message": "line 1: expected ':'"}
+    OTHER = {"checked": False, "ok": None,
+             "message": "Automatic syntax check is only available for Python."}
+
+    def test_python_syntax_still_invalid_never_says_no_changes_needed(self):
+        summary = summarize_fix(self.fix([], self.PY_BAD))
+        self.assertEqual(summary["kind"], "invalid")
+        self.assertIn("could not produce a valid correction", summary["message"])
+        self.assertIsNone(summary["no_changes_note"])
+
+    def test_invalid_syntax_with_changes_is_also_invalid(self):
+        summary = summarize_fix(self.fix(good_fix()["changes"], self.PY_BAD))
+        self.assertEqual(summary["kind"], "invalid")
+
+    def test_python_no_changes_note_when_syntax_is_valid(self):
+        summary = summarize_fix(self.fix([], self.PY_OK))
+        self.assertEqual(summary["kind"], "verified")
+        self.assertIn("No changes were needed", summary["no_changes_note"])
+        self.assertIn("logic", summary["no_changes_note"])
+
+    def test_verified_with_changes_has_no_no_changes_note(self):
+        summary = summarize_fix(self.fix(good_fix()["changes"], self.PY_OK))
+        self.assertIsNone(summary["no_changes_note"])
+        self.assertIn("NOT a functional test", summary["message"])
+
+    def test_other_language_no_changes_is_the_models_assessment_only(self):
+        summary = summarize_fix(self.fix([], self.OTHER))
+        self.assertEqual(summary["kind"], "unverified")
+        self.assertIn("model's assessment", summary["no_changes_note"])
+        self.assertIn("not been verified", summary["no_changes_note"])
+
+
+class TestConciseErrors(unittest.TestCase):
+    """Provider details belong in the log, not in what the student sees."""
+
+    def test_unknown_error_hides_raw_details(self):
+        message = map_error(ValueError("secret-provider-detail-123")).message
+        self.assertNotIn("secret-provider-detail-123", message)
+
+    def test_bad_request_hides_raw_details(self):
+        class BadRequestError(Exception):
+            status_code = 400
+        message = map_error(BadRequestError("internal-trace-id-456")).message
+        self.assertNotIn("internal-trace-id-456", message)
 
 
 if __name__ == "__main__":

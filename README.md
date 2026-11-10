@@ -56,6 +56,8 @@ requirements.txt      Dependencies
    ```
    It opens at http://localhost:8501
 
+Tested with Python 3.13, streamlit 1.61.1, openai 3.33.0 and python-dotenv 1.1.1 on Windows (the exact versions are pinned in `requirements.txt`). Deployed on Streamlit Community Cloud, which ran Python 3.14 at deployment time.
+
 ### Configuration
 | Setting | Required | Default |
 |---|---|---|
@@ -76,15 +78,32 @@ Every change the AI lists refers to the **original** code (1-based line numbers)
 
 | Action | Rule |
 |---|---|
-| `replace` | line 1..N, `before` = the exact original line, `after` = new text |
-| `delete` | line 1..N, `before` = the exact original line, `after` is empty |
-| `insert` | line 1..N+1, `before` is empty, the new line goes **before** original line `line` (N+1 = add at the end) |
+| `replace` | line 1..N, `before` = the original line, `after` = new text (not empty) |
+| `delete` | line 1..N, `before` = the original line, `after` is empty |
+| `insert` | line 1..N+1, `before` is empty, `after` = new text (not empty). The new line goes **before** original line `line` (N+1 = add at the end) |
 
-Then the app applies the change list to the original code and compares the result with `fixed_code`.
-Whitespace policy for that comparison: line endings, trailing spaces and blank lines are ignored;
-indentation and every other character must match. A reply that breaks any rule, or an empty change list
-with a different program, is rejected and the AI is asked again (up to 3 tries). If no valid reply arrives,
-the student sees an error instead of a convincing but wrong table.
+Rules in detail:
+- A line can be replaced or deleted only once. Line numbers outside the snippet (0, negative, too large) are rejected.
+- `before` is matched against the original line **ignoring spaces at the start and end of that line**. Indentation is still verified by the final comparison.
+- The app then applies the change list to your original code and compares the result with `fixed_code`.
+  **The two must be identical.** The only normalisation is: line endings are converted to `\n`, and whitespace at the
+  very end of the whole snippet is ignored. Blank lines, trailing spaces inside the snippet, indentation and the contents of
+  multi-line strings (Python `"""..."""`, JavaScript template literals, docstrings) are meaningful and must match exactly.
+- With an empty change list, `fixed_code` must therefore be your original code, unchanged.
+- A reply that breaks a rule is rejected and the AI is asked again with the reason (up to 3 tries). If no valid reply arrives,
+  the student sees an error instead of a convincing but wrong table.
+- Because blank lines count, a "fix" that only adds or removes blank lines (pure reformatting) cannot be expressed and is not offered.
+
+What is checked and what is not:
+
+| Checked by the app | Still only a model suggestion |
+|---|---|
+| Change list matches the original code and produces `fixed_code` exactly | Whether the fix keeps the intended behaviour of your program |
+| Python only: `fixed_code` parses (syntax check) | The error type, root cause and explanations |
+| | "No changes needed" for non-Python code (not compiler-verified) |
+
+Status messages follow the validation result: if the Python code is still syntactically invalid after the retries, the app says
+the assistant could not produce a valid correction, and never says "no changes needed".
 
 ## Deploy on Streamlit Community Cloud
 1. Push `app.py`, `llm_service.py`, `utils.py`, `requirements.txt` and `.gitignore` to a GitHub repository. Do **not** push `.env`.
@@ -99,7 +118,8 @@ the student sees an error instead of a convincing but wrong table.
 - AI explanations can be wrong. Always read and test the result yourself.
 - Free Groq limits apply (requests and tokens per minute and per day). On a public deployment all visitors share them.
 - The fix feature is not streamed because JSON must be complete before it can be validated.
-- The change-list check is strict on purpose, so "Suggest Fix" may occasionally fail after 3 tries with a clear message. Click it again.
+- The change-list check is strict on purpose (blank lines, spaces and string contents must be preserved), so "Suggest Fix" may occasionally fail after 3 tries with a clear message. Click it again.
 - The check proves the change list matches the suggested code. It cannot prove the suggested code keeps the program's intended behaviour.
+- Technical details of failed AI requests are written to the server log; students only see a short message.
 - Input limits: 6000 characters of code, 3000 characters of error message.
 - Changing the code, error message or language clears the previous results and chat on purpose.

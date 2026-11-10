@@ -3,11 +3,14 @@ llm_service.py - all model calls, prompts and fix-generation logic.
 No Streamlit in here, and the API client is passed in, so everything can be
 tested with a fake client:  python -m unittest discover -v
 """
+import logging
 import time
 
 from utils import (LLMError, RETRYABLE, build_chat_context, check_python_syntax,
                    extract_json, map_error, number_lines, validate_fix, wrap_untrusted)
 
+
+logger = logging.getLogger(__name__)
 
 # ============================================================
 # Prompts (prompt engineering, few-shot, injection defence)
@@ -75,6 +78,8 @@ RULES FOR "changes" (they always refer to the ORIGINAL code and its line numbers
 - "before" and "after" must not contain the line-number prefix (like "3: "); keep indentation exactly.
 - Do not change the same line twice. Do not list changes that you did not make.
 - "fixed_code" must be EXACTLY the original code with these changes applied, nothing more.
+- Keep every other character of the original: blank lines, spaces, indentation and the contents of
+  multi-line strings must stay exactly as they are. Do not reformat.
 - If the code is already correct, "changes" is [] and "fixed_code" is the original code unchanged.
 - Every field is required."""
 
@@ -108,6 +113,9 @@ class LLMService:
                 return text.strip()
             except Exception as error:
                 mapped = map_error(error)
+                # Full provider details go to the log; the student only sees the short message.
+                logger.warning("Model request failed (%s, attempt %d of %d): %s: %s",
+                               mapped.kind, attempt, attempts, type(error).__name__, error)
                 # Invalid key, wrong model, rate limit etc. will not fix themselves -> no retry
                 if mapped.kind not in RETRYABLE or attempt == attempts:
                     raise mapped from None
@@ -136,6 +144,7 @@ class LLMService:
                     produced += piece
                     yield piece
         except Exception as error:
+            logger.warning("Model stream failed: %s: %s", type(error).__name__, error)
             raise map_error(error) from None
         if not produced.strip():
             raise LLMError("empty", "The model returned an empty response.")
@@ -236,6 +245,9 @@ NOW DEBUG THIS (line numbers are added for reference):
 
             if cleaned is None:
                 last_problem = problem
+                # Rejection reasons go to the log (not to the student) so failures can be diagnosed.
+                logger.warning("Fix reply rejected (attempt %d of 3): %s | reply began: %r",
+                               attempt + 1, problem, raw[:300])
                 feedback = (f"\n\nYour previous reply was rejected because {problem}. "
                             "Return ONE valid JSON object in the exact shape above, "
                             "following the rules for \"changes\".")

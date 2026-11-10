@@ -37,20 +37,29 @@ def map_error(error):
     if name == "NotFoundError" or status == 404:
         return LLMError("model", "The model was not found. Check MODEL_NAME.")
     if name == "BadRequestError" or status == 400:
-        return LLMError("bad_request", f"The request was rejected by the AI service: {error}")
+        return LLMError("bad_request", "The AI service rejected the request. Try a shorter snippet or try again.")
     if name in {"APIConnectionError", "APITimeoutError", "InternalServerError"} or (
             isinstance(status, int) and status >= 500):
         return LLMError("temporary", "The AI service is temporarily unavailable. Please try again shortly.")
-    return LLMError("unknown", f"Unexpected error: {error}")
+    return LLMError("unknown", "Something went wrong while contacting the AI service. Please try again.")
 
 
 # ============================================================
 # Prompt helpers
 # ============================================================
+def canonical_code(code):
+    """The ONLY normalisation applied to code before it is compared or numbered:
+      * line endings are converted to \\n (a transport detail), and
+      * whitespace at the very END of the whole snippet is dropped.
+    Blank lines, trailing spaces inside the snippet, indentation and string contents
+    are meaningful program data and are never changed."""
+    return code.replace("\r\n", "\n").replace("\r", "\n").rstrip()
+
+
 def split_lines(code):
     """Split code into lines. Leading blank lines are kept so line numbers match
-    the student's original snippet (only trailing whitespace is removed)."""
-    return code.replace("\r\n", "\n").rstrip().split("\n")
+    the student's original snippet."""
+    return canonical_code(code).split("\n")
 
 
 def number_lines(code):
@@ -88,24 +97,20 @@ def extract_json(text):
 # Change-list rules
 #
 # Every change refers to the ORIGINAL code (1-based line numbers):
-#   replace : line 1..N        before = exact original line, after = new text (not empty)
-#   delete  : line 1..N        before = exact original line, after = ""
-#   insert  : line 1..N+1      before = "",  after = new text. The new line is placed
-#                              BEFORE original line `line` (N+1 means "add at the end").
-# "before" is compared with the original line ignoring leading/trailing spaces.
-# A line may be replaced or deleted only once.
+#   replace : line 1..N        before = the original line, after = new text (not empty)
+#   delete  : line 1..N        before = the original line, after = ""
+#   insert  : line 1..N+1      before = "",  after = new text (not empty). The new line is
+#                              placed BEFORE original line `line` (N+1 means "add at the end").
+# "before" is matched against the original line ignoring spaces at the start and end of that
+# line (indentation is still checked by the final comparison below). A line may be replaced or
+# deleted only once.
 #
-# Whitespace policy used when comparing code (normalize_code):
-#   line endings, trailing spaces and blank lines are ignored;
-#   indentation and every other character must match exactly.
+# Final comparison: the change list is applied to the original code and the result must equal
+# `fixed_code` EXACTLY after canonical_code() (line endings + whitespace at the very end of the
+# snippet). Blank lines, trailing spaces inside the snippet, indentation and string contents all
+# have to match. With an empty change list, `fixed_code` must therefore be the original code.
 # ============================================================
 ALLOWED_ACTIONS = ("replace", "insert", "delete")
-
-
-def normalize_code(code):
-    """Return the code as a list of lines for comparison (see whitespace policy above)."""
-    lines = [line.rstrip() for line in code.replace("\r\n", "\n").split("\n")]
-    return [line for line in lines if line.strip()]
 
 
 def apply_changes(original_code, changes):
@@ -180,7 +185,7 @@ def validate_fix(data, original_code):
     fixed = data.get("fixed_code")
     if not isinstance(fixed, str) or not fixed.strip():
         return None, "'fixed_code' must be non-empty text"
-    cleaned["fixed_code"] = fixed.strip("\n")
+    cleaned["fixed_code"] = canonical_code(fixed)
 
     steps = data.get("reasoning_steps")
     if not isinstance(steps, list) or not steps:
@@ -214,16 +219,18 @@ def validate_fix(data, original_code):
                                 "after": after, "reason": reason.strip()})
     cleaned["changes"] = cleaned_changes
 
-    # --- check against the ORIGINAL code ---
+    # --- check against the ORIGINAL code (strict: meaningful whitespace is preserved) ---
     new_code, problem = apply_changes(original_code, cleaned_changes)
     if problem:
         return None, problem
-    if normalize_code(new_code) != normalize_code(cleaned["fixed_code"]):
+    if canonical_code(new_code) != cleaned["fixed_code"]:
         if not cleaned_changes:
-            return None, ("'changes' is empty but 'fixed_code' is different from the original code. "
-                          "List every change, or return the original code unchanged if it is already correct")
+            return None, ("'changes' is empty but 'fixed_code' is not identical to the original code "
+                          "(blank lines, spaces and indentation must match too). List every change, "
+                          "or return the original code unchanged if it is already correct")
         return None, ("applying the listed 'changes' to the original code does not produce "
-                      "'fixed_code'; the change list is incomplete or wrong")
+                      "'fixed_code' exactly (blank lines, spaces and indentation must match too); "
+                      "the change list is incomplete or wrong")
     return cleaned, None
 
 
@@ -240,6 +247,42 @@ def check_python_syntax(code):
         return False, f"line {error.lineno}: {error.msg}"
     except (ValueError, MemoryError, RecursionError) as error:
         return False, str(error)
+
+
+# ============================================================
+# What the interface may tell the student about a fix
+# ============================================================
+def summarize_fix(fix):
+    """Decide which status messages are consistent with the validation outcome.
+    Returns {"kind": "invalid" | "verified" | "unverified", "message": str, "no_changes_note": str | None}.
+    "No changes were needed" is only ever produced when it does not contradict the syntax check."""
+    syntax = fix["syntax"]
+    no_changes = not fix["changes"]
+
+    if syntax["checked"] and not syntax["ok"]:
+        return {
+            "kind": "invalid",
+            "message": ("The assistant could not produce a valid correction: the code it suggested "
+                        f"still has a Python syntax error ({syntax['message']}). "
+                        "Please try again, or ask in the Chat tab."),
+            "no_changes_note": None,
+        }
+    if syntax["checked"]:
+        return {
+            "kind": "verified",
+            "message": ("Python syntax check passed (the code parses). This is NOT a functional test - "
+                        "run it to confirm it behaves as you expect."),
+            "no_changes_note": ("No changes were needed according to the AI. The code parses, but this "
+                                "does not prove it behaves correctly, so it may still contain logic "
+                                "errors.") if no_changes else None,
+        }
+    return {
+        "kind": "unverified",
+        "message": f"{syntax['message']} Review and test the code yourself.",
+        "no_changes_note": ("The AI judged that this code needs no changes. This is the model's "
+                            "assessment only; it has not been verified by a compiler or tests.")
+        if no_changes else None,
+    }
 
 
 # ============================================================

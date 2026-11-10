@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from llm_service import LLMService
-from utils import LLMError
+from utils import LLMError, summarize_fix
 
 
 # ============================================================
@@ -201,6 +201,58 @@ def empty_state(icon, title, subtitle):
     )
 
 
+def render_fix_details(fix, language, trusted=True):
+    """Show a validated fix. trusted=False is used for a rejected suggestion that is placed
+    inside an expander (so: no nested expanders and no download button)."""
+    summary = summarize_fix(fix)
+
+    if trusted:
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Error type", fix["error_type"])
+        m2.metric("Lines changed", len(fix["changes"]))
+        m3.metric("Language", language)
+    else:
+        st.caption(f"Error type suggested by the AI: {fix['error_type']}")
+
+    (st.success if trusted else st.info)(f"**Root cause:** {fix['root_cause']}")
+
+    if trusted:
+        with st.expander("🧠 Step-by-step reasoning", expanded=True):
+            for i, step in enumerate(fix["reasoning_steps"], start=1):
+                st.markdown(f"{i}. {step}")
+    else:
+        st.markdown("**Step-by-step reasoning**")
+        for i, step in enumerate(fix["reasoning_steps"], start=1):
+            st.markdown(f"{i}. {step}")
+
+    if fix["changes"]:
+        st.markdown("**What changed:**")
+        st.table([
+            {"Line": c["line"], "Action": c["action"], "Before": c["before"],
+             "After": c["after"], "Why": c["reason"]}
+            for c in fix["changes"]
+        ])
+    elif summary["no_changes_note"]:
+        st.info(summary["no_changes_note"])      # only shown when it agrees with the validation
+    else:
+        st.caption("The AI listed no changes.")
+
+    st.markdown("**Corrected code:**" if trusted else "**Suggested code (rejected):**")
+    st.code(fix["fixed_code"], language=language.lower())
+
+    if trusted:
+        (st.success if summary["kind"] == "verified" else st.info)(summary["message"])
+
+    st.info(f"**Explanation:** {fix['explanation']}")
+
+    if trusted:
+        extensions = {"Python": "py", "Java": "java", "C": "c", "C++": "cpp", "JavaScript": "js"}
+        st.download_button("⬇️ Download fixed code", fix["fixed_code"],
+                           file_name=f"fixed_code.{extensions.get(language, 'txt')}")
+        with st.expander("View structured JSON output"):
+            st.json(fix)
+
+
 # ============================================================
 # 6. Sidebar
 # ============================================================
@@ -340,48 +392,13 @@ with right_col:
         if not fix:
             empty_state("✅", "No fix yet",
                         "Click <b>Suggest Fix</b> to get a corrected version of your code.")
+        elif summarize_fix(fix)["kind"] == "invalid":
+            # Never show "no changes needed" or a normal result when the code is still invalid
+            st.error(summarize_fix(fix)["message"])
+            with st.expander("Show the rejected suggestion (do not trust it)"):
+                render_fix_details(fix, language, trusted=False)
         else:
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Error type", fix["error_type"])
-            m2.metric("Lines changed", len(fix["changes"]))
-            m3.metric("Language", language)
-
-            st.success(f"**Root cause:** {fix['root_cause']}")
-
-            with st.expander("🧠 Step-by-step reasoning", expanded=True):
-                for i, step in enumerate(fix["reasoning_steps"], start=1):
-                    st.markdown(f"{i}. {step}")
-
-            if fix["changes"]:
-                st.markdown("**What changed:**")
-                st.table([
-                    {"Line": c["line"], "Action": c["action"], "Before": c["before"],
-                     "After": c["after"], "Why": c["reason"]}
-                    for c in fix["changes"]
-                ])
-            else:
-                st.info("No changes were needed. The AI found no problem with this code.")
-
-            st.markdown("**Corrected code:**")
-            st.code(fix["fixed_code"], language=language.lower())
-
-            syntax = fix["syntax"]
-            if syntax["checked"] and syntax["ok"]:
-                st.success("✅ Python syntax check passed (the code parses). "
-                           "This is NOT a functional test - run it to confirm it behaves as you expect.")
-            elif syntax["checked"]:
-                st.warning(f"⚠️ The suggested code still has a Python syntax error "
-                           f"({syntax['message']}). Do not trust it - try again or ask in the Chat tab.")
-            else:
-                st.info(f"ℹ️ {syntax['message']} Review and test the code yourself.")
-
-            st.info(f"**Explanation:** {fix['explanation']}")
-            extensions = {"Python": "py", "Java": "java", "C": "c",
-                          "C++": "cpp", "JavaScript": "js"}
-            st.download_button("⬇️ Download fixed code", fix["fixed_code"],
-                               file_name=f"fixed_code.{extensions.get(language, 'txt')}")
-            with st.expander("View structured JSON output"):
-                st.json(fix)
+            render_fix_details(fix, language, trusted=True)
 
     with tab_chat:
         chat_container = st.container(height=400, border=True)
